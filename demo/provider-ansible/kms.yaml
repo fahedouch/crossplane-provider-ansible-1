@@ -1,0 +1,10 @@
+apiVersion: kms.ansible-provider-gcp.crossplane.io/v1alpha1
+kind: PANAPI
+metadata:
+  name: keyring-dna-toto
+spec:
+  forProvider:
+    location: global
+    data: "toto"
+  providerConfigRef:
+    name: default
