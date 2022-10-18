@@ -5,10 +5,13 @@
 - [Crossplane Provider for Ansible](#crossplane-provider-for-ansible)
   - [Overview](#overview)
   - [Getting Started and Documentation](#getting-started-and-documentation)
+  - [Contributing](#contributing)
   - [Report a Bug](#report-a-bug)
+  - [Contact](#contact)
+  - [Governance and Owners](#governance-and-owners)
+  - [Code of Conduct](#code-of-conduct)
   - [Developer guide](#developer-guide)
     - [Run against a Kubernetes cluster](#run-against-a-kubernetes-cluster)
-    - [Basic Usage](#basic-usage)
   - [Additional documents](#additional-documents)
   - [Licensing](#licensing)
 
@@ -54,7 +57,7 @@ Please use the following to reach members of the community:
 
 ## Governance and Owners
 
-`provider-ansible` is run according to the same
+`provider-ansible` is running according to the same
 [Governance](https://github.com/crossplane/crossplane/blob/master/GOVERNANCE.md)
 and [Ownership](https://github.com/crossplane/crossplane/blob/master/OWNERS.md)
 structure as the core Crossplane project.
