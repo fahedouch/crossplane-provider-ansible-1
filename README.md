@@ -94,3 +94,5 @@ make dev-clean
 ## Licensing
 
 provider-ansible is under the Apache 2.0 license.
+
+#### this commit is signed with a gpg key ####
