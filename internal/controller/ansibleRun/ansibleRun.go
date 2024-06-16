@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -87,11 +86,19 @@ type ansibleRunner interface {
 	GetAnsibleRunPolicy() *ansible.RunPolicy
 	WriteExtraVar(extraVar map[string]interface{}) error
 	EnableCheckMode(checkMode bool)
-	Run() (*exec.Cmd, io.Reader, error)
+	Run(ctx context.Context) (io.Reader, error)
+}
+
+// SetupOptions constains settings specific to the ansible run controller.
+type SetupOptions struct {
+	AnsibleCollectionsPath string
+	AnsibleRolesPath       string
+	Timeout                time.Duration
+	ArtifactsHistoryLimit  int
 }
 
 // Setup adds a controller that reconciles AnsibleRun managed resources.
-func Setup(mgr ctrl.Manager, o controller.Options, ansibleCollectionsPath, ansibleRolesPath string, timeout time.Duration) error {
+func Setup(mgr ctrl.Manager, o controller.Options, s SetupOptions) error {
 	name := managed.ControllerName(v1alpha1.AnsibleRunGroupKind)
 
 	fs := afero.Afero{Fs: afero.NewOsFs()}
@@ -111,11 +118,12 @@ func Setup(mgr ctrl.Manager, o controller.Options, ansibleCollectionsPath, ansib
 		fs:    fs,
 		ansible: func(dir string) params {
 			return ansible.Parameters{
-				WorkingDirPath:  dir,
-				GalaxyBinary:    galaxyBinary,
-				RunnerBinary:    runnerBinary,
-				CollectionsPath: ansibleCollectionsPath,
-				RolesPath:       ansibleRolesPath,
+				WorkingDirPath:        dir,
+				GalaxyBinary:          galaxyBinary,
+				RunnerBinary:          runnerBinary,
+				CollectionsPath:       s.AnsibleCollectionsPath,
+				RolesPath:             s.AnsibleRolesPath,
+				ArtifactsHistoryLimit: s.ArtifactsHistoryLimit,
 			}
 		},
 	}
@@ -124,7 +132,7 @@ func Setup(mgr ctrl.Manager, o controller.Options, ansibleCollectionsPath, ansib
 		resource.ManagedKind(v1alpha1.AnsibleRunGroupVersionKind),
 		managed.WithExternalConnecter(c),
 		managed.WithLogger(o.Logger.WithValues("controller", name)),
-		managed.WithTimeout(timeout),
+		managed.WithTimeout(s.Timeout),
 		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))))
 
 	return ctrl.NewControllerManagedBy(mgr).
@@ -353,15 +361,12 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 			return managed.ExternalObservation{}, err
 		}
 		c.runner.EnableCheckMode(true)
-		dc, stdoutBuf, err := c.runner.Run()
+		stdoutBuf, err := c.runner.Run(ctx)
 		if err != nil {
 			return managed.ExternalObservation{}, err
 		}
 		res, err := results.ParseJSONResultsStream(stdoutBuf)
 		if err != nil {
-			return managed.ExternalObservation{}, err
-		}
-		if err = dc.Wait(); err != nil {
 			return managed.ExternalObservation{}, err
 		}
 		changes := ansible.Diff(res)
@@ -384,30 +389,26 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
 	// No difference from the provider side which lifecycle method to choose in this case of Create() or Update()
 	u, err := c.Update(ctx, mg)
-	return managed.ExternalCreation{ConnectionDetails: u.ConnectionDetails}, err
+	return managed.ExternalCreation(u), err
 }
 
 func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.ExternalUpdate, error) {
-	_, ok := mg.(*v1alpha1.AnsibleRun)
+	cr, ok := mg.(*v1alpha1.AnsibleRun)
 	if !ok {
 		return managed.ExternalUpdate{}, errors.New(errNotAnsibleRun)
 	}
 
 	// disable checkMode for real action
 	c.runner.EnableCheckMode(false)
-	dc, _, err := c.runner.Run()
-	if err != nil {
-		return managed.ExternalUpdate{}, err
-	}
-	if err = dc.Wait(); err != nil {
-		return managed.ExternalUpdate{}, err
+	if err := c.runAnsible(ctx, cr); err != nil {
+		return managed.ExternalUpdate{}, fmt.Errorf("running ansible: %w", err)
 	}
 
 	// TODO handle ConnectionDetails https://github.com/multicloudlab/crossplane-provider-ansible/pull/74#discussion_r888467991
 	return managed.ExternalUpdate{ConnectionDetails: nil}, nil
 }
 
-func (c *external) Delete(_ context.Context, mg resource.Managed) error {
+func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 	cr, ok := mg.(*v1alpha1.AnsibleRun)
 	if !ok {
 		return errors.New(errNotAnsibleRun)
@@ -422,11 +423,8 @@ func (c *external) Delete(_ context.Context, mg resource.Managed) error {
 	if err := c.runner.WriteExtraVar(nestedMap); err != nil {
 		return err
 	}
-	dc, _, err := c.runner.Run()
+	_, err := c.runner.Run(ctx)
 	if err != nil {
-		return err
-	}
-	if err = dc.Wait(); err != nil {
 		return err
 	}
 	return nil
@@ -445,44 +443,43 @@ func getLastAppliedParameters(observed *v1alpha1.AnsibleRun) (*v1alpha1.AnsibleR
 	return lastParameters, nil
 }
 
-// nolint: gocyclo
-// TODO reduce cyclomatic complexity
 func (c *external) handleLastApplied(ctx context.Context, lastParameters *v1alpha1.AnsibleRunParameters, desired *v1alpha1.AnsibleRun) (managed.ExternalObservation, error) {
-	isUpToDate := false
-	if lastParameters != nil {
-		if equality.Semantic.DeepEqual(*lastParameters, desired.Spec.ForProvider) {
-			// Mark as up-to-date since last is equal to desired
-			isUpToDate = true
+	// Mark as up-to-date if last is equal to desired
+	isUpToDate := (lastParameters != nil && equality.Semantic.DeepEqual(*lastParameters, desired.Spec.ForProvider))
+
+	isLastSyncOK := (desired.GetCondition(xpv1.TypeSynced).Status == v1.ConditionTrue)
+
+	if isUpToDate && isLastSyncOK {
+		desired.SetConditions(xpv1.Available())
+		if err := c.kube.Status().Update(ctx, desired); err != nil {
+			return managed.ExternalObservation{}, fmt.Errorf("updating status: %w", err)
 		}
+		// nothing to do for this run
+		return managed.ExternalObservation{ResourceExists: true, ResourceUpToDate: true}, nil
 	}
 
-	if !isUpToDate {
-		out, err := json.Marshal(desired.Spec.ForProvider)
-		if err != nil {
-			return managed.ExternalObservation{}, err
-		}
-		// set LastAppliedConfig Annotation to avoid useless cmd run
-		meta.AddAnnotations(desired, map[string]string{
-			v1.LastAppliedConfigAnnotation: string(out),
-		})
+	out, err := json.Marshal(desired.Spec.ForProvider)
+	if err != nil {
+		return managed.ExternalObservation{}, err
+	}
+	// set LastAppliedConfig Annotation to avoid useless cmd run
+	meta.AddAnnotations(desired, map[string]string{
+		v1.LastAppliedConfigAnnotation: string(out),
+	})
 
-		if err := c.kube.Update(ctx, desired); err != nil {
-			return managed.ExternalObservation{}, err
-		}
-		stateVar := make(map[string]string)
-		stateVar["state"] = "present"
-		nestedMap := make(map[string]interface{})
-		nestedMap[desired.GetName()] = stateVar
-		if err := c.runner.WriteExtraVar(nestedMap); err != nil {
-			return managed.ExternalObservation{}, err
-		}
-		dc, _, err := c.runner.Run()
-		if err != nil {
-			return managed.ExternalObservation{}, err
-		}
-		if err = dc.Wait(); err != nil {
-			return managed.ExternalObservation{}, err
-		}
+	if err := c.kube.Update(ctx, desired); err != nil {
+		return managed.ExternalObservation{}, err
+	}
+	stateVar := make(map[string]string)
+	stateVar["state"] = "present"
+	nestedMap := make(map[string]interface{})
+	nestedMap[desired.GetName()] = stateVar
+	if err := c.runner.WriteExtraVar(nestedMap); err != nil {
+		return managed.ExternalObservation{}, err
+	}
+
+	if err := c.runAnsible(ctx, desired); err != nil {
+		return managed.ExternalObservation{}, fmt.Errorf("running ansible: %w", err)
 	}
 
 	// The crossplane runtime is not aware of the external resource created by ansible content.
@@ -490,6 +487,23 @@ func (c *external) handleLastApplied(ctx context.Context, lastParameters *v1alph
 	// changes, so we requeue a speculative reconcile after the specified poll
 	// interval in order to observe it and react accordingly.
 	return managed.ExternalObservation{ResourceExists: true, ResourceUpToDate: true}, nil
+}
+
+func (c *external) runAnsible(ctx context.Context, cr *v1alpha1.AnsibleRun) error {
+	_, err := c.runner.Run(ctx)
+	if err != nil {
+		cond := xpv1.Unavailable()
+		cond.Message = err.Error()
+		cr.SetConditions(cond)
+	} else {
+		cr.SetConditions(xpv1.Available())
+	}
+
+	if err := c.kube.Status().Update(ctx, cr); err != nil {
+		return fmt.Errorf("updating status: %w", err)
+	}
+
+	return err
 }
 
 func addBehaviorVars(pc *v1alpha1.ProviderConfig) map[string]string {

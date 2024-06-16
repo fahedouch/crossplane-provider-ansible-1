@@ -19,7 +19,7 @@ jobs:
         allow-edits: "false"
         permission-level: write
     - name: Handle Command
-      uses: actions/github-script@v6
+      uses: actions/github-script@v7
       env:
         POINTS: ${{ steps.command.outputs.command-arguments }}
       with:
@@ -80,12 +80,12 @@ jobs:
         permission-level: write
 
     - name: Checkout
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         fetch-depth: 0
 
     - name: Open Backport PR
-      uses: zeebe-io/backport-action@v1.2.0
+      uses: zeebe-io/backport-action@v3.0.2
       with:
         github_token: ${{ secrets.GITHUB_TOKEN }}
         github_workspace: ${{ github.workspace }}
