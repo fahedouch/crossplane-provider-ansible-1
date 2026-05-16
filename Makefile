@@ -14,37 +14,39 @@ PLATFORMS ?= linux_amd64 linux_arm64
 # ====================================================================================
 # Setup Go
 
-GO_REQUIRED_VERSION = 1.19
+GO_REQUIRED_VERSION = 1.24.13
 NPROCS ?= 1
 GO_TEST_PARALLEL := $(shell echo $$(( $(NPROCS) / 2 )))
 GO_STATIC_PACKAGES = $(GO_PROJECT)/cmd/provider
 GO_LDFLAGS += -X $(GO_PROJECT)/internal/version.Version=$(VERSION)
 GO_SUBDIRS += cmd internal apis
 GO111MODULE = on
-GOLANGCILINT_VERSION = 1.50.0
+GOLANGCILINT_VERSION = 2.5.0 
 RUNNING_IN_CI = true
 -include build/makelib/golang.mk
 
 # ====================================================================================
 # Setup Kubernetes tools
 
-UP_VERSION = v0.14.0
-UP_CHANNEL = stable
+# Uncomment below to override the versions from the build module
+# KIND_VERSION = v0.15.0
+UP_VERSION = v0.44.3
+# UP_CHANNEL = stable
+UPTEST_VERSION = v0.5.0
+CROSSPLANE_VERSION = 1.16.0
 -include build/makelib/k8s_tools.mk
 
 # ====================================================================================
 # Setup Images
-
+REGISTRY_ORGS ?= ghcr.io/crossplane-contrib
 IMAGES = provider-ansible
 -include build/makelib/imagelight.mk
 
 # ====================================================================================
 # Setup XPKG
 
-XPKG_REG_ORGS ?= xpkg.upbound.io/crossplane-contrib index.docker.io/crossplanecontrib
-# NOTE(hasheddan): skip promoting on xpkg.upbound.io as channel tags are
-# inferred.
-XPKG_REG_ORGS_NO_PROMOTE ?= xpkg.upbound.io/crossplane-contrib
+XPKG_REG_ORGS ?= ghcr.io/crossplane-contrib index.docker.io/crossplanecontrib
+XPKG_REG_ORGS_NO_PROMOTE ?= ghcr.io/crossplane-contrib
 XPKGS = provider-ansible
 -include build/makelib/xpkg.mk
 
@@ -108,7 +110,7 @@ dev: $(KIND) $(KUBECTL)
 	@$(KIND) create cluster --name=$(PROJECT_NAME)-dev | true
 	@$(KUBECTL) cluster-info --context kind-$(PROJECT_NAME)-dev
 	@$(INFO) Installing Crossplane CRDs
-	@$(KUBECTL) apply -k https://github.com/crossplane/crossplane//cluster?ref=master
+	@$(KUBECTL) apply --server-side=true -k https://github.com/crossplane/crossplane//cluster?ref=v$(CROSSPLANE_VERSION)
 	@$(INFO) Installing Provider Ansible CRDs
 	@$(KUBECTL) apply -R -f package/crds
 	@$(INFO) Starting Provider Ansible controllers
@@ -139,3 +141,6 @@ crossplane.help:
 help-special: crossplane.help
 
 .PHONY: crossplane.help help-special
+
+vendor: modules.download
+vendor.check: modules.check

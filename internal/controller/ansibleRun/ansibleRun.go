@@ -20,35 +20,41 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/apenella/go-ansible/pkg/stdoutcallback/results"
-	"github.com/crossplane-contrib/provider-ansible/apis/v1alpha1"
-	"github.com/crossplane-contrib/provider-ansible/internal/ansible"
-	"github.com/crossplane-contrib/provider-ansible/pkg/galaxyutil"
-	"github.com/crossplane-contrib/provider-ansible/pkg/runnerutil"
 	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/pkg/controller"
 	"github.com/crossplane/crossplane-runtime/pkg/event"
+	"github.com/crossplane/crossplane-runtime/pkg/logging"
 	"github.com/crossplane/crossplane-runtime/pkg/meta"
 	"github.com/crossplane/crossplane-runtime/pkg/ratelimiter"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
+	"github.com/crossplane/crossplane-runtime/pkg/statemetrics"
+	"github.com/google/uuid"
 	"github.com/spf13/afero"
-	"gopkg.in/yaml.v2"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/yaml"
+
+	"github.com/crossplane-contrib/provider-ansible/apis/v1alpha1"
+	"github.com/crossplane-contrib/provider-ansible/internal/ansible"
+	"github.com/crossplane-contrib/provider-ansible/pkg/galaxyutil"
+	"github.com/crossplane-contrib/provider-ansible/pkg/runnerutil"
+	"github.com/crossplane-contrib/provider-ansible/pkg/shardutil"
 )
 
 const (
@@ -75,6 +81,13 @@ const (
 )
 
 const (
+	leaseNameTemplate           = "provider-ansible-lease-%d"
+	leaseDurationSeconds        = 30
+	leaseRenewalInterval        = 5 * time.Second
+	leaseAcquireAttemptInterval = 5 * time.Second
+)
+
+const (
 	baseWorkingDir = "/ansibleDir"
 )
 
@@ -87,11 +100,23 @@ type ansibleRunner interface {
 	GetAnsibleRunPolicy() *ansible.RunPolicy
 	WriteExtraVar(extraVar map[string]interface{}) error
 	EnableCheckMode(checkMode bool)
-	Run() (*exec.Cmd, io.Reader, error)
+	Run(ctx context.Context) (io.Reader, error)
+}
+
+// SetupOptions constains settings specific to the ansible run controller.
+type SetupOptions struct {
+	AnsibleCollectionsPath string
+	AnsibleRolesPath       string
+	Timeout                time.Duration
+	ArtifactsHistoryLimit  int
+	ReplicasCount          uint32
+	LeaseNamespace         string
+	ProviderCtx            context.Context
+	ProviderCancel         context.CancelFunc
 }
 
 // Setup adds a controller that reconciles AnsibleRun managed resources.
-func Setup(mgr ctrl.Manager, o controller.Options, ansibleCollectionsPath, ansibleRolesPath string, timeout time.Duration) error {
+func Setup(mgr ctrl.Manager, o controller.Options, s SetupOptions) error {
 	name := managed.ControllerName(v1alpha1.AnsibleRunGroupKind)
 
 	fs := afero.Afero{Fs: afero.NewOsFs()}
@@ -111,47 +136,67 @@ func Setup(mgr ctrl.Manager, o controller.Options, ansibleCollectionsPath, ansib
 		fs:    fs,
 		ansible: func(dir string) params {
 			return ansible.Parameters{
-				WorkingDirPath:  dir,
-				GalaxyBinary:    galaxyBinary,
-				RunnerBinary:    runnerBinary,
-				CollectionsPath: ansibleCollectionsPath,
-				RolesPath:       ansibleRolesPath,
+				WorkingDirPath:        dir,
+				GalaxyBinary:          galaxyBinary,
+				RunnerBinary:          runnerBinary,
+				CollectionsPath:       s.AnsibleCollectionsPath,
+				RolesPath:             s.AnsibleRolesPath,
+				ArtifactsHistoryLimit: s.ArtifactsHistoryLimit,
 			}
 		},
+		replicaID:      uuid.New().String(),
+		leaseNamespace: s.LeaseNamespace,
+		logger:         o.Logger,
 	}
 
-	r := managed.NewReconciler(mgr,
-		resource.ManagedKind(v1alpha1.AnsibleRunGroupVersionKind),
-		managed.WithExternalConnecter(c),
+	opts := []managed.ReconcilerOption{
+		managed.WithTypedExternalConnector(c),
 		managed.WithLogger(o.Logger.WithValues("controller", name)),
-		managed.WithTimeout(timeout),
-		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))))
+		managed.WithTimeout(s.Timeout),
+		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
+	}
+
+	if o.MetricOptions != nil {
+		opts = append(opts, managed.WithMetricRecorder(o.MetricOptions.MRMetrics))
+		if o.MetricOptions.MRStateMetrics != nil {
+			stateMetricsRecorder := statemetrics.NewMRStateRecorder(mgr.GetClient(), o.Logger, o.MetricOptions.MRStateMetrics, &v1alpha1.AnsibleRunList{}, o.MetricOptions.PollStateMetricInterval)
+			if err := mgr.Add(stateMetricsRecorder); err != nil {
+				return fmt.Errorf("cannot register MR state metrics recorder for kind v1alpha1.AnsibleRunList: %w", err)
+			}
+		}
+	}
+
+	r := managed.NewReconciler(mgr, resource.ManagedKind(v1alpha1.AnsibleRunGroupVersionKind), opts...)
+
+	currentShard, err := c.acquireAndHoldShard(o, s)
+	if err != nil {
+		return fmt.Errorf("cannot acquire and hold shard: %w", err)
+	}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		Named(name).
 		WithOptions(o.ForControllerRuntime()).
 		For(&v1alpha1.AnsibleRun{}).
+		WithEventFilter(shardutil.IsResourceForShard(currentShard, s.ReplicasCount)).
 		Complete(ratelimiter.NewReconciler(name, r, o.GlobalRateLimiter))
 }
 
 // A connector is expected to produce an ExternalClient when its Connect method
 // is called.
 type connector struct {
-	kube    client.Client
-	usage   resource.Tracker
-	fs      afero.Afero
-	ansible func(dir string) params
+	kube           client.Client
+	usage          resource.Tracker
+	fs             afero.Afero
+	ansible        func(dir string) params
+	replicaID      string
+	leaseNamespace string
+	logger         logging.Logger
 }
 
-func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.ExternalClient, error) { //nolint:gocyclo
+func (c *connector) Connect(ctx context.Context, cr *v1alpha1.AnsibleRun) (managed.TypedExternalClient[*v1alpha1.AnsibleRun], error) { //nolint:gocyclo
 	// NOTE(negz): This method is slightly over our complexity goal, but I
 	// can't immediately think of a clean way to decompose it without
 	// affecting readability.
-
-	cr, ok := mg.(*v1alpha1.AnsibleRun)
-	if !ok {
-		return nil, errors.New(errNotAnsibleRun)
-	}
 
 	// NOTE(negz): This directory will be garbage collected by the workdir
 	// garbage collector that is started in Setup.
@@ -160,7 +205,7 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		return nil, fmt.Errorf("%s: %s: %w", baseWorkingDir, errMkdir, err)
 	}
 
-	if err := c.usage.Track(ctx, mg); err != nil {
+	if err := c.usage.Track(ctx, cr); err != nil {
 		return nil, fmt.Errorf("%s: %w", errTrackPCUsage, err)
 	}
 
@@ -200,6 +245,33 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		}
 	}
 
+	// prepare git credentials for ansible-galaxy to fetch remote roles
+	// TODO(fahed) support other private remote repository
+	// NOTE(ytsarev): Retrieve .git-credentials from Spec to /tmp outside of AnsibleRun directory
+	gitCredDir := filepath.Clean(filepath.Join("/tmp", dir))
+	if err := c.fs.MkdirAll(gitCredDir, 0700); err != nil {
+		return nil, fmt.Errorf("%s: %w", errWriteGitCreds, err)
+	}
+	for _, cd := range pc.Spec.Credentials {
+		if cd.Filename != gitCredentialsFilename {
+			continue
+		}
+		data, err := resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", errGetCreds, err)
+		}
+		p := filepath.Clean(filepath.Join(gitCredDir, filepath.Base(cd.Filename)))
+		if err := c.fs.WriteFile(p, data, 0600); err != nil {
+			return nil, fmt.Errorf("%s: %w", errWriteGitCreds, err)
+		}
+		// NOTE(ytsarev): Make go-getter pick up .git-credentials, see /.gitconfig in the container image
+		// TODO: check wether go-getter is used in the ansible case
+		err = os.Setenv("GIT_CRED_DIR", gitCredDir)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", errRemoteConfiguration, err)
+		}
+	}
+
 	var requirementRoles []byte
 	if len(cr.Spec.ForProvider.Roles) != 0 {
 		// marshall cr.Spec.ForProvider.Roles entries into yaml document
@@ -209,32 +281,6 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		requirementRoles, err = yaml.Marshal(&rolesMap)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", errMarshalRoles, err)
-		}
-		// prepare git credentials for ansible-galaxy to fetch remote roles
-		// TODO(fahed) support other private remote repository
-		// NOTE(ytsarev): Retrieve .git-credentials from Spec to /tmp outside of AnsibleRun directory
-		gitCredDir := filepath.Clean(filepath.Join("/tmp", dir))
-		if err := c.fs.MkdirAll(gitCredDir, 0700); err != nil {
-			return nil, fmt.Errorf("%s: %w", errWriteGitCreds, err)
-		}
-		for _, cd := range pc.Spec.Credentials {
-			if cd.Filename != gitCredentialsFilename {
-				continue
-			}
-			data, err := resource.CommonCredentialExtractor(ctx, cd.Source, c.kube, cd.CommonCredentialSelectors)
-			if err != nil {
-				return nil, fmt.Errorf("%s: %w", errGetCreds, err)
-			}
-			p := filepath.Clean(filepath.Join(gitCredDir, filepath.Base(cd.Filename)))
-			if err := c.fs.WriteFile(p, data, 0600); err != nil {
-				return nil, fmt.Errorf("%s: %w", errWriteGitCreds, err)
-			}
-			// NOTE(ytsarev): Make go-getter pick up .git-credentials, see /.gitconfig in the container image
-			// TODO: check wether go-getter is used in the ansible case
-			err = os.Setenv("GIT_CRED_DIR", gitCredDir)
-			if err != nil {
-				return nil, fmt.Errorf("%s: %w", errRemoteConfiguration, err)
-			}
 		}
 	} else if cr.Spec.ForProvider.PlaybookInline != nil {
 		if err := c.fs.WriteFile(filepath.Join(dir, runnerutil.PlaybookYml), []byte(*cr.Spec.ForProvider.PlaybookInline), 0600); err != nil {
@@ -307,13 +353,14 @@ type external struct {
 	kube   client.Client
 }
 
+func (e *external) Disconnect(ctx context.Context) error {
+	// Unimplemented, required by newer versions of crossplane-runtime
+	return nil
+}
+
 // nolint: gocyclo
 // TODO reduce cyclomatic complexity
-func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
-	cr, ok := mg.(*v1alpha1.AnsibleRun)
-	if !ok {
-		return managed.ExternalObservation{}, errors.New(errNotAnsibleRun)
-	}
+func (c *external) Observe(ctx context.Context, cr *v1alpha1.AnsibleRun) (managed.ExternalObservation, error) {
 	/* set Deletion Policy to Orphan as we cannot observe the external resource.
 	   So we won't wait for external resource deletion before attempting
 	   to delete the managed resource */
@@ -353,15 +400,12 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 			return managed.ExternalObservation{}, err
 		}
 		c.runner.EnableCheckMode(true)
-		dc, stdoutBuf, err := c.runner.Run()
+		stdoutBuf, err := c.runner.Run(ctx)
 		if err != nil {
 			return managed.ExternalObservation{}, err
 		}
 		res, err := results.ParseJSONResultsStream(stdoutBuf)
 		if err != nil {
-			return managed.ExternalObservation{}, err
-		}
-		if err = dc.Wait(); err != nil {
 			return managed.ExternalObservation{}, err
 		}
 		changes := ansible.Diff(res)
@@ -381,38 +425,24 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	return managed.ExternalObservation{}, nil
 }
 
-func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
+func (c *external) Create(ctx context.Context, cr *v1alpha1.AnsibleRun) (managed.ExternalCreation, error) {
 	// No difference from the provider side which lifecycle method to choose in this case of Create() or Update()
-	u, err := c.Update(ctx, mg)
-	return managed.ExternalCreation{ConnectionDetails: u.ConnectionDetails}, err
+	u, err := c.Update(ctx, cr)
+	return managed.ExternalCreation(u), err
 }
 
-func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.ExternalUpdate, error) {
-	_, ok := mg.(*v1alpha1.AnsibleRun)
-	if !ok {
-		return managed.ExternalUpdate{}, errors.New(errNotAnsibleRun)
-	}
-
+func (c *external) Update(ctx context.Context, cr *v1alpha1.AnsibleRun) (managed.ExternalUpdate, error) {
 	// disable checkMode for real action
 	c.runner.EnableCheckMode(false)
-	dc, _, err := c.runner.Run()
-	if err != nil {
-		return managed.ExternalUpdate{}, err
-	}
-	if err = dc.Wait(); err != nil {
-		return managed.ExternalUpdate{}, err
+	if err := c.runAnsible(ctx, cr); err != nil {
+		return managed.ExternalUpdate{}, fmt.Errorf("running ansible: %w", err)
 	}
 
 	// TODO handle ConnectionDetails https://github.com/multicloudlab/crossplane-provider-ansible/pull/74#discussion_r888467991
 	return managed.ExternalUpdate{ConnectionDetails: nil}, nil
 }
 
-func (c *external) Delete(_ context.Context, mg resource.Managed) error {
-	cr, ok := mg.(*v1alpha1.AnsibleRun)
-	if !ok {
-		return errors.New(errNotAnsibleRun)
-	}
-
+func (c *external) Delete(ctx context.Context, cr *v1alpha1.AnsibleRun) (managed.ExternalDelete, error) {
 	cr.Status.SetConditions(xpv1.Deleting())
 
 	stateVar := make(map[string]string)
@@ -420,16 +450,13 @@ func (c *external) Delete(_ context.Context, mg resource.Managed) error {
 	nestedMap := make(map[string]interface{})
 	nestedMap[cr.GetName()] = stateVar
 	if err := c.runner.WriteExtraVar(nestedMap); err != nil {
-		return err
+		return managed.ExternalDelete{}, err
 	}
-	dc, _, err := c.runner.Run()
+	_, err := c.runner.Run(ctx)
 	if err != nil {
-		return err
+		return managed.ExternalDelete{}, err
 	}
-	if err = dc.Wait(); err != nil {
-		return err
-	}
-	return nil
+	return managed.ExternalDelete{}, nil
 }
 
 func getLastAppliedParameters(observed *v1alpha1.AnsibleRun) (*v1alpha1.AnsibleRunParameters, error) {
@@ -445,44 +472,43 @@ func getLastAppliedParameters(observed *v1alpha1.AnsibleRun) (*v1alpha1.AnsibleR
 	return lastParameters, nil
 }
 
-// nolint: gocyclo
-// TODO reduce cyclomatic complexity
 func (c *external) handleLastApplied(ctx context.Context, lastParameters *v1alpha1.AnsibleRunParameters, desired *v1alpha1.AnsibleRun) (managed.ExternalObservation, error) {
-	isUpToDate := false
-	if lastParameters != nil {
-		if equality.Semantic.DeepEqual(*lastParameters, desired.Spec.ForProvider) {
-			// Mark as up-to-date since last is equal to desired
-			isUpToDate = true
+	// Mark as up-to-date if last is equal to desired
+	isUpToDate := (lastParameters != nil && equality.Semantic.DeepEqual(*lastParameters, desired.Spec.ForProvider))
+
+	isLastSyncOK := (desired.GetCondition(xpv1.TypeSynced).Status == v1.ConditionTrue)
+
+	if isUpToDate && isLastSyncOK {
+		desired.SetConditions(xpv1.Available())
+		if err := c.kube.Status().Update(ctx, desired); err != nil {
+			return managed.ExternalObservation{}, fmt.Errorf("updating status: %w", err)
 		}
+		// nothing to do for this run
+		return managed.ExternalObservation{ResourceExists: true, ResourceUpToDate: true}, nil
 	}
 
-	if !isUpToDate {
-		out, err := json.Marshal(desired.Spec.ForProvider)
-		if err != nil {
-			return managed.ExternalObservation{}, err
-		}
-		// set LastAppliedConfig Annotation to avoid useless cmd run
-		meta.AddAnnotations(desired, map[string]string{
-			v1.LastAppliedConfigAnnotation: string(out),
-		})
+	out, err := json.Marshal(desired.Spec.ForProvider)
+	if err != nil {
+		return managed.ExternalObservation{}, err
+	}
+	// set LastAppliedConfig Annotation to avoid useless cmd run
+	meta.AddAnnotations(desired, map[string]string{
+		v1.LastAppliedConfigAnnotation: string(out),
+	})
 
-		if err := c.kube.Update(ctx, desired); err != nil {
-			return managed.ExternalObservation{}, err
-		}
-		stateVar := make(map[string]string)
-		stateVar["state"] = "present"
-		nestedMap := make(map[string]interface{})
-		nestedMap[desired.GetName()] = stateVar
-		if err := c.runner.WriteExtraVar(nestedMap); err != nil {
-			return managed.ExternalObservation{}, err
-		}
-		dc, _, err := c.runner.Run()
-		if err != nil {
-			return managed.ExternalObservation{}, err
-		}
-		if err = dc.Wait(); err != nil {
-			return managed.ExternalObservation{}, err
-		}
+	if err := c.kube.Update(ctx, desired); err != nil {
+		return managed.ExternalObservation{}, err
+	}
+	stateVar := make(map[string]string)
+	stateVar["state"] = "present"
+	nestedMap := make(map[string]interface{})
+	nestedMap[desired.GetName()] = stateVar
+	if err := c.runner.WriteExtraVar(nestedMap); err != nil {
+		return managed.ExternalObservation{}, err
+	}
+
+	if err := c.runAnsible(ctx, desired); err != nil {
+		return managed.ExternalObservation{}, fmt.Errorf("running ansible: %w", err)
 	}
 
 	// The crossplane runtime is not aware of the external resource created by ansible content.
@@ -492,10 +518,156 @@ func (c *external) handleLastApplied(ctx context.Context, lastParameters *v1alph
 	return managed.ExternalObservation{ResourceExists: true, ResourceUpToDate: true}, nil
 }
 
+func (c *external) runAnsible(ctx context.Context, cr *v1alpha1.AnsibleRun) error {
+	_, err := c.runner.Run(ctx)
+	if err != nil {
+		cond := xpv1.Unavailable()
+		cond.Message = err.Error()
+		cr.SetConditions(cond)
+	} else {
+		cr.SetConditions(xpv1.Available())
+	}
+
+	if err := c.kube.Status().Update(ctx, cr); err != nil {
+		return fmt.Errorf("updating status: %w", err)
+	}
+
+	return err
+}
+
 func addBehaviorVars(pc *v1alpha1.ProviderConfig) map[string]string {
 	behaviorVars := make(map[string]string, len(pc.Spec.Vars))
 	for _, v := range pc.Spec.Vars {
 		behaviorVars[v.Key] = v.Value
 	}
 	return behaviorVars
+}
+
+func (c *connector) generateLeaseName(index uint32) string {
+	return fmt.Sprintf(leaseNameTemplate, index)
+}
+
+func (c *connector) releaseLease(ctx context.Context, kube client.Client, index uint32) error {
+	leaseName := c.generateLeaseName(index)
+
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{Namespace: c.leaseNamespace, Name: leaseName},
+	}
+
+	return kube.Delete(ctx, lease)
+}
+
+// Attempts to acquire or renew a lease for the current replica ID
+// Returns an error when unable to obtain the lease
+func (c *connector) acquireLease(ctx context.Context, kube client.Client, index uint32) error {
+	lease := &coordinationv1.Lease{}
+	leaseName := c.generateLeaseName(index)
+	leaseDurationSeconds := ptr.To(int32(leaseDurationSeconds))
+
+	if err := kube.Get(ctx, client.ObjectKey{Namespace: c.leaseNamespace, Name: leaseName}, lease); err != nil {
+		if !kerrors.IsNotFound(err) {
+			return err
+		}
+
+		// Create a new Lease
+		lease = &coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      leaseName,
+				Namespace: c.leaseNamespace,
+			},
+			Spec: coordinationv1.LeaseSpec{
+				HolderIdentity:       &c.replicaID,
+				RenewTime:            &metav1.MicroTime{Time: time.Now()},
+				LeaseDurationSeconds: leaseDurationSeconds,
+			},
+		}
+		if err := kube.Create(ctx, lease); err != nil {
+			return err
+		}
+		c.logger.Debug("created lease", "lease", lease)
+		return nil
+	}
+
+	// Check if the lease is held by another replica and is not expired
+	if lease.Spec.HolderIdentity != nil && *lease.Spec.HolderIdentity != c.replicaID {
+		if lease.Spec.RenewTime != nil && time.Since(lease.Spec.RenewTime.Time) < time.Duration(*lease.Spec.LeaseDurationSeconds)*time.Second {
+			// Lease is held by another replica and is not expired
+			return fmt.Errorf("lease is still held by %s", *lease.Spec.HolderIdentity)
+		}
+	}
+
+	// Update the lease to acquire it
+	lease.Spec.HolderIdentity = ptr.To(c.replicaID)
+	lease.Spec.RenewTime = &metav1.MicroTime{Time: time.Now()}
+	lease.Spec.LeaseDurationSeconds = leaseDurationSeconds
+	if err := kube.Update(ctx, lease); err != nil {
+		if kerrors.IsConflict(err) {
+			// Another replica updated the lease concurrently, retry
+			return err
+		}
+		return fmt.Errorf("failed to update lease: %w", err)
+	}
+
+	c.logger.Debug("updated lease", "lease", lease)
+	return nil
+}
+
+// Finds an available shard and acquires a lease for it. Will attempt to obtain one indefinitely.
+// This will also start a background go-routine to renew the lease continuously and release it when the process receives a shutdown signal.
+// When ReplicasCount is 1, lease acquisition is skipped and shard 0 is returned immediately.
+func (c *connector) acquireAndHoldShard(o controller.Options, s SetupOptions) (uint32, error) {
+	if s.ReplicasCount == 1 {
+		return 0, nil
+	}
+
+	ctx := s.ProviderCtx
+
+	cfg := ctrl.GetConfigOrDie()
+	kube, err := client.New(cfg, client.Options{})
+	if err != nil {
+		return 0, err
+	}
+
+	for {
+		if shard, ok := c.tryAcquireShard(ctx, kube, o, s); ok {
+			return shard, nil
+		}
+	}
+}
+
+func (c *connector) tryAcquireShard(ctx context.Context, kube client.Client, o controller.Options, s SetupOptions) (uint32, bool) {
+	for i := uint32(0); i < s.ReplicasCount; i++ {
+		if err := c.acquireLease(ctx, kube, i); err != nil {
+			o.Logger.Debug("cannot acquire lease", "id", i, "err", err)
+			time.Sleep(leaseAcquireAttemptInterval)
+			continue
+		}
+		o.Logger.Debug("acquired lease", "id", i)
+		go c.holdShard(ctx, kube, i, o, s)
+		return i, true
+	}
+	return 0, false
+}
+
+func (c *connector) holdShard(ctx context.Context, kube client.Client, i uint32, o controller.Options, s SetupOptions) {
+	sigHandler := ctrl.SetupSignalHandler()
+	for {
+		select {
+		case <-time.After(leaseRenewalInterval):
+			if err := c.acquireLease(ctx, kube, i); err != nil {
+				o.Logger.Info("failed to renew lease", "id", i, "err", err)
+				s.ProviderCancel()
+			} else {
+				o.Logger.Debug("renewed lease", "id", i)
+			}
+		case <-sigHandler.Done():
+			o.Logger.Info("controller is shutting down, releasing lease")
+			if err := c.releaseLease(ctx, kube, i); err != nil {
+				o.Logger.Info("failed to release lease", "lease", err)
+			}
+			o.Logger.Debug("released lease")
+			s.ProviderCancel()
+			return
+		}
+	}
 }
